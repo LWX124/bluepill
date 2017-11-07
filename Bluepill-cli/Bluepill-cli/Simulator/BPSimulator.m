@@ -59,6 +59,11 @@
                                     name:deviceName
                        completionHandler:^(NSError *error, SimDevice *device) {
                            __self.device = device;
+
+                           if (__self.config.screenshotsDirectory) {
+                               __self.screenshotService = [[SimulatorScreenshotService alloc] initWithConfiguration:__self.config forDevice:device];
+                           }
+
                            if (!__self.device || error) {
                                dispatch_async(dispatch_get_main_queue(), ^{
                                    completion(error);
@@ -88,58 +93,21 @@
     }
 
     if (!self.config.headlessMode) {
-        self.app = [self findSimGUIAppWithDeviceUDID: [deviceUDID UUIDString]];
+        self.app = [self findSimGUIApp];
         if (!self.app) {
             [BPUtils printInfo:ERROR withString:[NSString stringWithFormat:@"SimDevice running, but no running Simulator App in non-headless mode: %@",
                                                  [deviceUDID UUIDString]]];
             return NO;
         }
     }
+
     return YES;
 }
 
-
 - (void)bootWithCompletion:(void (^)(NSError *error))completion {
     // Now boot it.
-    if (self.config.headlessMode) {
-        [BPUtils printInfo:INFO withString:@"Running in HEADLESS mode..."];
-        [self openSimulatorHeadlessWithCompletion:completion];
-        return;
-    }
-    // not headless? open the simulator app.
-    [BPUtils printInfo:INFO withString:@"Running in NON-headless mode..."];
-    [self openSimulatorWithCompletion:completion];
-}
-
-- (void)openSimulatorWithCompletion:(void (^)(NSError *))completion {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSError *error;
-        NSURL *simulatorURL = [NSURL fileURLWithPath:
-                               [NSString stringWithFormat:@"%@/Applications/Simulator.app/Contents/MacOS/Simulator",
-                                self.config.xcodePath]];
-
-        NSDictionary *configuration = @{NSWorkspaceLaunchConfigurationArguments: @[@"-CurrentDeviceUDID", [[self.device UDID] UUIDString]]};
-        NSWorkspaceLaunchOptions launchOptions = NSWorkspaceLaunchAsync |
-        NSWorkspaceLaunchWithoutActivation |
-        NSWorkspaceLaunchAndHide |
-        NSWorkspaceLaunchNewInstance;
-        self.app = [[NSWorkspace sharedWorkspace]
-                    launchApplicationAtURL:simulatorURL
-                    options:launchOptions
-                    configuration:configuration
-                    error:&error];
-        if (!self.app) {
-            assert(error != nil);
-            completion(error);
-            return;
-        }
-        error = [self waitForDeviceReady];
-        if (error) {
-            [self.app terminate];
-        }
-        completion(error);
-        return;
-    });
+    [BPUtils printInfo:INFO withString:@"Booting a simulator without launching Simulator app"];
+    [self openSimulatorHeadlessWithCompletion:completion];
 }
 
 - (void)openSimulatorHeadlessWithCompletion:(void (^)(NSError *))completion {
@@ -149,7 +117,10 @@
     [self.device bootAsyncWithOptions:options completionHandler:^(NSError *bootError){
         NSError *error = [self waitForDeviceReady];
         if (error) {
-            [self.app terminate];
+            [self.device shutdownWithError:&error];
+            if (error) {
+                [BPUtils printInfo:ERROR withString:@"Shutting down Simulator failed: %@", [error localizedDescription]];
+            }
         }
         completion(bootError);
     }];
@@ -186,9 +157,9 @@
     return device; //could be nil when not found
  }
 
-- (NSRunningApplication *)findSimGUIAppWithDeviceUDID:(NSString *)deviceUDID {
-    NSString * cmd = [NSString stringWithFormat:@"ps -A | grep 'Simulator\\.app.*-CurrentDeviceUDID %@'", deviceUDID];
-    NSString * output = [[BPUtils runShell:cmd] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+- (NSRunningApplication *)findSimGUIApp {
+    NSString *cmd = [NSString stringWithFormat:@"ps -A | grep 'Simulator\\.app'"];
+    NSString *output = [[BPUtils runShell:cmd] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
     NSArray *fields = [output componentsSeparatedByString: @" "];
     if ([fields count] > 0) {
         NSString *pidStr = [fields objectAtIndex:0];
@@ -199,7 +170,34 @@
     return nil;
 }
 
+- (void)addVideosToSimulator {
+    for (NSString *urlString in self.config.videoPaths) {
+        NSURL *videoUrl = [NSURL URLWithString:urlString];
+        NSError *error;
+        BOOL uploadResult = [self.device addVideo:videoUrl error:&error];
+        if (!uploadResult) {
+            [BPUtils printInfo:ERROR withString:[NSString stringWithFormat:@"Failed to upload video at path: %@, error message: %@", urlString, [error description]]];
+        }
+    }
+}
+
+- (void)addPhotosToSimulator {
+    for (NSString *urlString in self.config.imagePaths) {
+        NSURL *photoUrl = [NSURL URLWithString:urlString];
+        NSError *error;
+        BOOL uploadResult = [self.device addPhoto:photoUrl error:&error];
+        if (!uploadResult) {
+            [BPUtils printInfo:ERROR withString:[NSString stringWithFormat:@"Failed to upload photo at path: %@, error message: %@", urlString, [error description]]];
+        }
+    }
+}
+
 - (BOOL)installApplicationAndReturnError:(NSError *__autoreleasing *)error {
+    // Add photos and videos to the simulator.
+    [self addPhotosToSimulator];
+    [self addVideosToSimulator];
+
+    // Install the app
     NSString *hostBundleId = [SimulatorHelper bundleIdForPath:self.config.appBundlePath];
     NSString *hostBundlePath = self.config.appBundlePath;
 
@@ -213,7 +211,7 @@
          hostBundleId, hostBundlePath];
         return NO;
     }
-
+    [BPUtils printInfo:DEBUGINFO withString: @"installApplication: host bundleId: %@, host BundlePath: %@, testRunnerAppPath: %@", hostBundleId, hostBundlePath, self.config.testRunnerAppPath];
     // Install the host application
     BOOL installed = [self.device
                       installApplication:[NSURL fileURLWithPath:hostBundlePath]
@@ -288,7 +286,8 @@
     NSMutableDictionary *appLaunchEnv = [appLaunchEnvironment mutableCopy];
     [appLaunchEnv setObject:simStdoutRelativePath forKey:kOptionsStdoutKey];
     [appLaunchEnv setObject:simStdoutRelativePath forKey:kOptionsStderrKey];
-
+    NSString *insertLibraryPath = [NSString stringWithFormat:@"%@/Platforms/iPhoneSimulator.platform/Developer/Library/PrivateFrameworks/IDEBundleInjection.framework/IDEBundleInjection", self.config.xcodePath];
+    [appLaunchEnv setObject:insertLibraryPath forKey:@"DYLD_INSERT_LIBRARIES"];
     int fd = open([simStdoutPath UTF8String], O_RDWR);
     self.stdOutHandle = [[NSFileHandle alloc] initWithFileDescriptor:fd];
 
@@ -306,6 +305,7 @@
         self.monitor = [[SimulatorMonitor alloc] initWithConfiguration:self.config];
     }
     self.monitor.device = self.device;
+    self.monitor.screenshotService = self.screenshotService;
     self.monitor.hostBundleId = hostBundleId;
     parser.delegate = self.monitor;
 
@@ -362,10 +362,7 @@
         completion(nil, NO);
         return;
     }
-    if (self.app) {
-        [BPUtils printInfo:INFO withString:@"Terminating Simulator.app"];
-        [self.app terminate];
-    } else if (self.device) {
+    if (self.device) {
         [BPUtils printInfo:INFO withString:@"Shutting down Simulator"];
         [self.device shutdownWithError:&error];
         if (error) {
